@@ -9,6 +9,14 @@ const INFO_ID = 0x1549A966;
 const TRACKS_ID = 0x1654AE6B;
 const CUES_ID = 0x1C53BB6B;
 const CLUSTER_ID = 0x1F43B675;
+const ATTACHMENTS_ID = 0x1941A469;
+const CHAPTERS_ID = 0x1043A770;
+const TAGS_ID = 0x1254C367;
+
+// Seek IDs
+const SEEK_ENTRY_ID = 0x4DBB;
+const SEEK_ID_ID = 0x53AB;
+const SEEK_POSITION_ID = 0x53AC;
 
 // Track Entry IDs
 const TRACK_ENTRY_ID = 0xAE;
@@ -59,7 +67,7 @@ function readVInt(buffer: Uint8Array, offset: number, isId: boolean = false): VI
 
   for (let i = 1; i < length; i++) {
     const b = buffer[offset + i];
-    rawId = (rawId << 8) | b;
+    rawId = (rawId * 256) + b;
     value = (value * 256) + b;
   }
 
@@ -79,19 +87,14 @@ function readUint(buffer: Uint8Array, offset: number, length: number): number {
   return val;
 }
 
-function readFloat(buffer: Uint8Array, offset: number, length: number): number {
-  const view = new DataView(buffer.buffer, buffer.byteOffset + offset, length);
-  if (length === 4) return view.getFloat32(0, false);
-  if (length === 8) return view.getFloat64(0, false);
-  return 0;
-}
-
 export class MkvDemuxer {
   private reader: DataReader;
   private timecodeScale: number = 1000000; // 1ms default
   private segmentOffset: number = 0;
   private segmentSize: number = 0;
   private tracks: Map<number, SubtitleTrack> = new Map();
+  private seekPositions: Map<number, number> = new Map(); // ElementID -> Absolute Offset
+  private firstClusterOffset: number = 0;
   private onProgress?: (progressText: string, percentage: number) => void;
 
   constructor(reader: DataReader, onProgress?: (text: string, pct: number) => void) {
@@ -103,7 +106,7 @@ export class MkvDemuxer {
     const startTime = Date.now();
     this.onProgress?.('MKV sarlavhasi o\'qilmoqda (EBML Header)...', 5);
 
-    // 1. Read first 256KB to parse EBML, Segment and Tracks
+    // Read first 256KB to parse EBML, Segment and Tracks
     const initialChunkSize = 256 * 1024;
     const initialBytes = await this.reader.read(0, initialChunkSize);
 
@@ -118,7 +121,7 @@ export class MkvDemuxer {
     if (!ebmlSize) throw new Error('EBML o\'lchami xato');
     offset += ebmlSize.length + ebmlSize.value;
 
-    // Now find Segment
+    // Find Segment
     const segId = readVInt(initialBytes, offset, true);
     if (!segId || segId.rawId !== SEGMENT_ID) {
       throw new Error('MKV Segment topilmadi');
@@ -134,7 +137,7 @@ export class MkvDemuxer {
 
     this.onProgress?.('Treklar va metadata tahlil qilinmoqda...', 15);
 
-    // Read inside segment for Tracks, Info, SeekHead
+    // Read inside segment for SeekHead, Info, Tracks
     await this.scanSegmentHeaders(initialBytes, offset);
 
     return Array.from(this.tracks.values());
@@ -144,7 +147,6 @@ export class MkvDemuxer {
     let offset = startOffset;
     let tracksFound = false;
 
-    // Scan the initial buffer elements
     while (offset < buffer.length - 16) {
       const elId = readVInt(buffer, offset, true);
       if (!elId) break;
@@ -154,38 +156,78 @@ export class MkvDemuxer {
       const headerLen = elId.length + elSize.length;
       const payloadOffset = offset + headerLen;
 
-      if (elId.rawId === INFO_ID) {
+      if (elId.rawId === SEEKHEAD_ID) {
+        this.parseSeekHead(buffer, payloadOffset, elSize.value);
+      } else if (elId.rawId === INFO_ID) {
         this.parseInfoElement(buffer, payloadOffset, elSize.value);
       } else if (elId.rawId === TRACKS_ID) {
         this.parseTracksElement(buffer, payloadOffset, elSize.value);
         tracksFound = true;
       } else if (elId.rawId === CLUSTER_ID) {
-        // We reached clusters, tracks must be before clusters
+        this.firstClusterOffset = offset;
         break;
+      } else if (elId.rawId === ATTACHMENTS_ID || elId.rawId === CHAPTERS_ID) {
+        // Skip huge elements like fonts/attachments
+        offset = payloadOffset + elSize.value;
+        continue;
       }
 
       offset = payloadOffset + elSize.value;
     }
 
+    // If Tracks wasn't in the first chunk, check SeekHead position
     if (!tracksFound) {
-      // If Tracks wasn't in the first 256KB, let's check seekhead or fetch a bigger 2MB chunk
-      const largerChunk = await this.reader.read(0, 2 * 1024 * 1024);
-      let o = this.segmentOffset;
-      while (o < largerChunk.length - 16) {
-        const elId = readVInt(largerChunk, o, true);
-        if (!elId) break;
-        const elSize = readVInt(largerChunk, o + elId.length, false);
-        if (!elSize) break;
-        const hLen = elId.length + elSize.length;
-        const pOffset = o + hLen;
-
-        if (elId.rawId === TRACKS_ID) {
-          this.parseTracksElement(largerChunk, pOffset, elSize.value);
-          tracksFound = true;
-          break;
+      const tracksPos = this.seekPositions.get(TRACKS_ID);
+      if (tracksPos) {
+        const tracksBytes = await this.reader.read(tracksPos, 64 * 1024);
+        const elId = readVInt(tracksBytes, 0, true);
+        const elSize = elId ? readVInt(tracksBytes, elId.length, false) : null;
+        if (elId && elSize) {
+          this.parseTracksElement(tracksBytes, elId.length + elSize.length, elSize.value);
         }
-        o = pOffset + elSize.value;
       }
+    }
+  }
+
+  private parseSeekHead(buffer: Uint8Array, offset: number, size: number) {
+    let o = offset;
+    const end = Math.min(offset + size, buffer.length);
+
+    while (o < end - 4) {
+      const elId = readVInt(buffer, o, true);
+      if (!elId) break;
+      const elSize = readVInt(buffer, o + elId.length, false);
+      if (!elSize) break;
+      const pOffset = o + elId.length + elSize.length;
+
+      if (elId.rawId === SEEK_ENTRY_ID) {
+        let entryO = pOffset;
+        const entryEnd = Math.min(pOffset + elSize.value, buffer.length);
+        let targetId = 0;
+        let targetPos = 0;
+
+        while (entryO < entryEnd - 2) {
+          const subId = readVInt(buffer, entryO, true);
+          if (!subId) break;
+          const subSize = readVInt(buffer, entryO + subId.length, false);
+          if (!subSize) break;
+          const subPayload = entryO + subId.length + subSize.length;
+
+          if (subId.rawId === SEEK_ID_ID) {
+            targetId = readUint(buffer, subPayload, subSize.value);
+          } else if (subId.rawId === SEEK_POSITION_ID) {
+            targetPos = readUint(buffer, subPayload, subSize.value);
+          }
+          entryO = subPayload + subSize.value;
+        }
+
+        if (targetId && targetPos) {
+          // SeekPosition is relative to the start of Segment data
+          const absolutePos = this.segmentOffset + targetPos;
+          this.seekPositions.set(targetId, absolutePos);
+        }
+      }
+      o = pOffset + elSize.value;
     }
   }
 
@@ -297,7 +339,7 @@ export class MkvDemuxer {
 
   /**
    * Fast Range-based cluster scanning:
-   * Skips huge video/audio clusters and only reads subtitle blocks
+   * Skips non-cluster data and only parses subtitle blocks
    */
   async extractAllSubtitles(selectedTrackNumbers?: number[]): Promise<{ tracks: SubtitleTrack[]; stats: ExtractionStats }> {
     const startTime = Date.now();
@@ -318,20 +360,24 @@ export class MkvDemuxer {
     const totalFileSize = await this.reader.getSize();
     this.onProgress?.('Subtitr bloklari klasterlardan ajratib olinmoqda...', 25);
 
-    let currentFilePos = this.segmentOffset;
-    let clusterCount = 0;
-    let cueIdCounter = 1;
+    // If attachments exist, skip them directly
+    const attachmentsPos = this.seekPositions.get(ATTACHMENTS_ID);
+    const chaptersPos = this.seekPositions.get(CHAPTERS_ID);
+    let currentFilePos = this.firstClusterOffset || this.segmentOffset;
 
-    // Scan file sequentially using streaming buffer chunks
-    const CHUNK_SIZE = 128 * 1024; // 128KB chunks
+    if (chaptersPos && chaptersPos > currentFilePos) {
+      currentFilePos = chaptersPos;
+    }
+
+    let cueIdCounter = 1;
+    const CHUNK_SIZE = 512 * 1024; // 512KB chunks
     let buffer = await this.reader.read(currentFilePos, CHUNK_SIZE);
     let bufOffset = 0;
-
     let currentClusterTimecode = 0;
+    let lastProgressPct = 25;
 
     while (currentFilePos < totalFileSize && buffer.length > 0) {
       if (bufOffset >= buffer.length - 32) {
-        // Refill buffer
         currentFilePos += bufOffset;
         if (currentFilePos >= totalFileSize) break;
         buffer = await this.reader.read(currentFilePos, CHUNK_SIZE);
@@ -354,7 +400,6 @@ export class MkvDemuxer {
       const payloadOffset = bufOffset + headerLen;
 
       if (elId.rawId === CLUSTER_ID) {
-        clusterCount++;
         bufOffset = payloadOffset; // Step inside cluster
         continue;
       }
@@ -367,7 +412,6 @@ export class MkvDemuxer {
         continue;
       }
 
-      // Check for SimpleBlock or BlockGroup
       if (elId.rawId === SIMPLE_BLOCK_ID || elId.rawId === BLOCK_ID) {
         await this.parseBlockAsync(
           buffer,
@@ -396,13 +440,15 @@ export class MkvDemuxer {
         continue;
       }
 
-      // If it's a huge block (like video track), skip directly!
+      // Skip non-subtitle blocks
       bufOffset = payloadOffset + elSize.value;
 
-      // Update progress periodically
-      if (clusterCount % 20 === 0 && totalFileSize > 0) {
+      if (totalFileSize > 0) {
         const pct = Math.min(95, Math.round((currentFilePos / totalFileSize) * 100));
-        this.onProgress?.(`Klasterlar o'qilmoqda: ${pct}% (Faqat subtitr baytlari o'qilmoqda)`, pct);
+        if (pct >= lastProgressPct + 5) {
+          lastProgressPct = pct;
+          this.onProgress?.(`Klasterlar o'qilmoqda: ${pct}% (Faqat subtitr baytlari)`, pct);
+        }
       }
     }
 
@@ -453,7 +499,6 @@ export class MkvDemuxer {
     let blockBuffer = buffer;
     let blockOffset = offset;
 
-    // If block spans beyond current chunk buffer, fetch exact slice
     if (offset + size > buffer.length) {
       blockBuffer = await this.reader.read(filePos + offset, size);
       blockOffset = 0;
@@ -471,10 +516,8 @@ export class MkvDemuxer {
     if (!track) return;
 
     const headerLen = trackVInt.length;
-    // 2 bytes: relative timecode (int16 signed)
     const timecodeView = new DataView(blockBuffer.buffer, blockBuffer.byteOffset + blockOffset + headerLen, 2);
     const relTimecode = timecodeView.getInt16(0, false);
-    // 1 byte flags
     const flagsLen = 1;
 
     const payloadOffset = blockOffset + headerLen + 2 + flagsLen;
@@ -483,13 +526,11 @@ export class MkvDemuxer {
 
     const payloadText = readString(blockBuffer, payloadOffset, payloadLen);
 
-    // Calculate timestamps in seconds
     const timeScaleSec = this.timecodeScale / 1_000_000_000;
     const startTimeSec = (clusterTimecode + relTimecode) * timeScaleSec;
-    const durationSec = blockDuration !== undefined ? blockDuration * timeScaleSec : 3.0; // default 3s if duration not set
+    const durationSec = blockDuration !== undefined ? blockDuration * timeScaleSec : 3.0;
     const endTimeSec = startTimeSec + durationSec;
 
-    // Parse text based on codec
     const cleanCue = this.formatPayloadToCue(payloadText, startTimeSec, endTimeSec, track.codec, cueId);
     if (cleanCue) {
       track.cues.push(cleanCue);
@@ -544,16 +585,13 @@ export class MkvDemuxer {
     let text = payload.trim();
     let rawText = payload;
 
-    // ASS format: Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     if (codec.includes('ASS') || codec.includes('SSA')) {
-      // If payload is already a Dialogue line
       if (text.startsWith('Dialogue:')) {
         const parts = text.split(',');
         if (parts.length >= 10) {
           text = parts.slice(9).join(',');
         }
       } else {
-        // In MKV, ASS block payload is often: ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         const parts = text.split(',');
         if (parts.length >= 9) {
           text = parts.slice(8).join(',');

@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { UploadCloud, Link as LinkIcon, FileVideo, Globe, AlertCircle } from 'lucide-react';
+import { UploadCloud, Link as LinkIcon, FileVideo, Globe, AlertCircle, HelpCircle, Copy, Check, ExternalLink } from 'lucide-react';
 import { CORS_PROXIES } from '../../lib/corsProxy';
 
 interface FileOrUrlInputProps {
@@ -21,11 +21,14 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
     ? 'https://example.com/video.mkv yoki Seedr / Direct video havolasi'
     : 'https://example.com/subtitles.srt yoki havola'
 }) => {
-  const [activeTab, setActiveTab] = useState<'file' | 'url'>('url');
+  const [activeTab, setActiveTab] = useState<'url' | 'file'>('url');
   const [inputUrl, setInputUrl] = useState('');
-  const [proxyId, setProxyId] = useState('corsproxy_io');
+  const [proxyId, setProxyId] = useState('direct');
   const [customProxy, setCustomProxy] = useState('');
   const [isDragging, setIsDragging] = useState(false);
+  const [showCorsHelp, setShowCorsHelp] = useState(false);
+  const [copiedWorker, setCopiedWorker] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -58,15 +61,46 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
     }
   };
 
-  const setSampleUrl = (sample: string, proxy: string = 'corsproxy_io') => {
-    setInputUrl(sample);
-    setProxyId(proxy);
+  const workerCode = `export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Expose-Headers": "*",
+        },
+      });
+    }
+    const url = new URL(request.url);
+    const targetUrl = url.searchParams.get("url") || url.pathname.slice(1);
+    if (!targetUrl) return new Response("Missing url param", { status: 400 });
+
+    const newHeaders = new Headers(request.headers);
+    newHeaders.delete("host");
+    newHeaders.delete("origin");
+    newHeaders.delete("referer");
+
+    const response = await fetch(targetUrl, { method: request.method, headers: newHeaders });
+    const respHeaders = new Headers(response.headers);
+    respHeaders.set("Access-Control-Allow-Origin", "*");
+    respHeaders.set("Access-Control-Expose-Headers", "*");
+
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: respHeaders });
+  },
+};`;
+
+  const copyWorkerCode = () => {
+    navigator.clipboard.writeText(workerCode);
+    setCopiedWorker(true);
+    setTimeout(() => setCopiedWorker(false), 2000);
   };
 
   return (
-    <div className="glass-panel rounded-2xl p-5 border border-slate-800">
+    <div className="glass-panel rounded-2xl p-5 border border-slate-800 space-y-4">
       {/* Tab Switcher */}
-      <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800">
+      <div className="flex items-center justify-between pb-3 border-b border-slate-800">
         <div className="flex space-x-2 bg-slate-900/80 p-1 rounded-xl border border-slate-800">
           <button
             type="button"
@@ -94,10 +128,14 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
           </button>
         </div>
 
-        <div className="hidden sm:flex items-center space-x-2 text-xs text-slate-400">
-          <FileVideo className="w-4 h-4 text-indigo-400" />
-          <span>Faqat bir necha KB yuklanadi</span>
-        </div>
+        <button
+          type="button"
+          onClick={() => setShowCorsHelp(true)}
+          className="flex items-center space-x-1.5 px-2.5 py-1.5 text-xs text-indigo-300 hover:text-white bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/30 rounded-lg transition"
+        >
+          <HelpCircle className="w-3.5 h-3.5 text-indigo-400" />
+          <span className="hidden sm:inline">CORS & Proxy Yechimlari</span>
+        </button>
       </div>
 
       {activeTab === 'url' ? (
@@ -126,11 +164,11 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
             </div>
           </div>
 
-          {/* CORS Proxy & Presets */}
+          {/* CORS Proxy & Custom Options */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
             <div>
               <label className="block text-[11px] font-medium text-slate-400 mb-1">
-                CORS Bypass Rejimi:
+                Ulanish Usuli (CORS Rejimi):
               </label>
               <select
                 value={proxyId}
@@ -140,49 +178,33 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
                 {CORS_PROXIES.map(p => (
                   <option key={p.id} value={p.id}>{p.name}</option>
                 ))}
-                <option value="custom">Maxsus CORS Proxy URL...</option>
+                <option value="custom">Maxsus Cloudflare Worker / Proxy URL...</option>
               </select>
             </div>
 
             {proxyId === 'custom' && (
               <div>
                 <label className="block text-[11px] font-medium text-slate-400 mb-1">
-                  Maxsus Proxy URL ({'{url}'} bilan):
+                  Maxsus Worker URL ({'{url}'} yoki ?url=):
                 </label>
                 <input
                   type="text"
                   value={customProxy}
                   onChange={(e) => setCustomProxy(e.target.value)}
-                  placeholder="https://my-proxy.com/{url}"
+                  placeholder="https://my-worker.workers.dev/?url={url}"
                   className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-200"
                 />
               </div>
             )}
-
-            <div className="sm:col-span-2">
-              <span className="text-[11px] text-slate-400 mr-2">Namuna havolalar:</span>
-              <button
-                type="button"
-                onClick={() => setSampleUrl('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4', 'direct')}
-                className="text-[11px] text-indigo-400 hover:text-indigo-300 underline mr-3"
-              >
-                MP4 Namuna (Big Buck Bunny)
-              </button>
-              <button
-                type="button"
-                onClick={() => setSampleUrl('https://raw.githubusercontent.com/ietf-wg-cellar/matroska-test-files/master/test_files/test1.mkv', 'corsproxy_io')}
-                className="text-[11px] text-purple-400 hover:text-purple-300 underline"
-              >
-                MKV Namuna (Matroska Test)
-              </button>
-            </div>
           </div>
 
-          <div className="flex items-start space-x-2 text-[11px] text-slate-400 bg-slate-900/50 p-2.5 rounded-lg border border-slate-800/80">
+          <div className="flex items-start space-x-2 text-[11px] text-slate-400 bg-slate-900/60 p-3 rounded-xl border border-slate-800">
             <AlertCircle className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
-            <span>
-              <strong>Eslatma:</strong> Seedr yoki boshqa CDN havolalarida agar to'g'ridan-to'g'ri o'qishda xatolik bersa, CORS Proxy rejimini <strong>CORSProxy.io</strong> yoki <strong>AllOrigins</strong> ga o'tkazing.
-            </span>
+            <div className="space-y-1">
+              <span>
+                <strong>Seedr va Direct havolalar uchun maslahat:</strong> Agar havolangiz CORS sababli bloklansa, brauzeringizga <strong>"Allow CORS"</strong> kengaytmasini o'rnating yoki <strong>"CORS & Proxy Yechimlari"</strong> tugmasidan 100% bepul shaxsiy Cloudflare Worker ulab oling.
+              </span>
+            </div>
           </div>
         </form>
       ) : (
@@ -216,6 +238,61 @@ export const FileOrUrlInput: React.FC<FileOrUrlInputProps> = ({
           <p className="text-[11px] text-emerald-400 mt-2">
             ⚡ 100 GB gacha bo'lgan fayllarni ham xotirani band qilmasdan bir zumda o'qiydi (File.slice)
           </p>
+        </div>
+      )}
+
+      {/* CORS Help Modal */}
+      {showCorsHelp && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-indigo-400" />
+                <span>CORS Xatoligini Yechish Bo'yicha Qo'llanma</span>
+              </h3>
+              <button
+                onClick={() => setShowCorsHelp(false)}
+                className="text-slate-400 hover:text-white text-xs px-2 py-1 bg-slate-800 rounded-lg"
+              >
+                Yopish
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-300 space-y-3 max-h-[70vh] overflow-y-auto pr-2">
+              <div className="p-3 bg-indigo-500/10 border border-indigo-500/30 rounded-xl space-y-1">
+                <p className="font-bold text-indigo-300">1-Usul: Bepul Cloudflare Worker (100% Barqaror va Cheksiz Tezlik)</p>
+                <p className="text-slate-400">
+                  Cloudflare'da bepul 100,000 so'rov/kunlik Worker ochib, quyidagi kodni qo'yishingiz mumkin:
+                </p>
+                <div className="relative mt-2">
+                  <pre className="p-3 bg-black/80 rounded-lg text-[10px] font-mono text-emerald-400 overflow-x-auto">
+                    {workerCode}
+                  </pre>
+                  <button
+                    onClick={copyWorkerCode}
+                    className="absolute right-2 top-2 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] flex items-center space-x-1"
+                  >
+                    {copiedWorker ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedWorker ? 'Nusxalandi!' : 'Kodni nusxalash'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-3 bg-slate-800/80 border border-slate-700 rounded-xl space-y-1">
+                <p className="font-bold text-slate-200">2-Usul: "Allow CORS" Brauzer Kengaytmasi</p>
+                <p className="text-slate-400">
+                  Chrome, Brave yoki Firefox do'konidan <strong>"Allow CORS: Access-Control-Allow-Origin"</strong> kengaytmasini yoqsangiz, hech qanday proksisiz to'g'ridan-to'g'ri Seedr serveridan maksimal tezlikda o'qiydi.
+                </p>
+              </div>
+
+              <div className="p-3 bg-slate-800/80 border border-slate-700 rounded-xl space-y-1">
+                <p className="font-bold text-slate-200">3-Usul: Lokal Fayl (Drag & Drop)</p>
+                <p className="text-slate-400">
+                  Faylni kompyuteringizdan Drag & Drop qilsangiz, internet va CORS ga umuman bog'liq bo'lmagan holda 0.1 soniyada barcha subtitrlarni ajratib beradi.
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
