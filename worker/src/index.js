@@ -1,6 +1,5 @@
 export default {
   async fetch(request, env, ctx) {
-    // Handle preflight OPTIONS request
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -43,14 +42,9 @@ export default {
     try {
       const forwardHeaders = new Headers();
 
-      const range = request.headers.get("Range") || request.headers.get("range");
+      const range = request.headers.get("range") || request.headers.get("Range");
       if (range) {
         forwardHeaders.set("Range", range);
-      }
-
-      const ifRange = request.headers.get("If-Range") || request.headers.get("if-range");
-      if (ifRange) {
-        forwardHeaders.set("If-Range", ifRange);
       }
 
       forwardHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
@@ -61,6 +55,9 @@ export default {
         method: request.method,
         headers: forwardHeaders,
         redirect: "follow",
+        cf: {
+          cacheEverything: false
+        }
       });
 
       const responseHeaders = new Headers(response.headers);

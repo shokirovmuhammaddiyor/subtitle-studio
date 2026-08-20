@@ -47,13 +47,13 @@ export class HttpRangeReader implements DataReader {
   private totalSize: number | null = null;
   private bytesRead: number = 0;
 
-  // 512KB Block Cache to avoid making thousands of small HTTP requests
-  private readonly BLOCK_SIZE = 512 * 1024;
+  // 256KB Block Cache
+  private readonly BLOCK_SIZE = 256 * 1024;
   private blockCache: Map<number, Uint8Array> = new Map();
 
-  constructor(rawUrl: string, proxyId: string = 'corsproxy_io', customProxy?: string) {
+  constructor(rawUrl: string, proxyId: string = 'cf_worker_official', customProxy?: string) {
     this.rawUrl = rawUrl.trim();
-    this.proxyId = proxyId;
+    this.proxyId = proxyId || 'cf_worker_official';
     this.customProxy = customProxy;
   }
 
@@ -64,17 +64,13 @@ export class HttpRangeReader implements DataReader {
   async getSize(): Promise<number> {
     if (this.totalSize !== null) return this.totalSize;
 
-    // List of proxies to try for size discovery
     const proxiesToTry = this.proxyId === 'custom'
       ? ['custom']
-      : [this.proxyId, 'corsproxy_io', 'corsproxy_org', 'direct'];
-
-    let lastError: any = null;
+      : [this.proxyId, 'cf_worker_official', 'direct'];
 
     for (const pId of proxiesToTry) {
       try {
         const targetUrl = this.getFetchUrl(pId);
-        // Range request for first byte: Range: bytes=0-0
         const res = await fetch(targetUrl, {
           headers: {
             'Range': 'bytes=0-0',
@@ -88,7 +84,12 @@ export class HttpRangeReader implements DataReader {
             const match = contentRange.match(/\/(\d+|\*)$/);
             if (match && match[1] !== '*') {
               this.totalSize = parseInt(match[1], 10);
-              this.proxyId = pId; // Remember working proxy
+              this.proxyId = pId;
+              // Clean up body immediately
+              if (res.body) {
+                const r = res.body.getReader();
+                r.cancel().catch(() => {});
+              }
               return this.totalSize;
             }
           }
@@ -96,15 +97,18 @@ export class HttpRangeReader implements DataReader {
           if (contentLength && parseInt(contentLength, 10) > 1) {
             this.totalSize = parseInt(contentLength, 10);
             this.proxyId = pId;
+            if (res.body) {
+              const r = res.body.getReader();
+              r.cancel().catch(() => {});
+            }
             return this.totalSize;
           }
         }
       } catch (err) {
-        lastError = err;
+        // try next proxy
       }
     }
 
-    // Default fallback if server doesn't report size
     this.totalSize = 0;
     return this.totalSize;
   }
@@ -119,9 +123,7 @@ export class HttpRangeReader implements DataReader {
 
     const proxiesToTry = this.proxyId === 'custom'
       ? ['custom']
-      : [this.proxyId, 'corsproxy_io', 'corsproxy_org', 'direct'];
-
-    let lastError: any = null;
+      : [this.proxyId, 'cf_worker_official', 'direct'];
 
     for (const pId of proxiesToTry) {
       try {
@@ -133,28 +135,53 @@ export class HttpRangeReader implements DataReader {
           }
         });
 
-        if (res.status === 206 || res.ok) {
+        if (res.status === 206) {
           const buf = await res.arrayBuffer();
           const bytes = new Uint8Array(buf);
           this.bytesRead += bytes.byteLength;
           this.blockCache.set(blockIndex, bytes);
-          this.proxyId = pId; // Stick with the working proxy
+          this.proxyId = pId;
           return bytes;
+        } else if (res.ok) {
+          // If server returns 200 (full body), read ONLY the needed chunk and cancel the stream!
+          if (res.body) {
+            const reader = res.body.getReader();
+            const chunks: Uint8Array[] = [];
+            let received = 0;
+
+            while (received < this.BLOCK_SIZE) {
+              const { done, value } = await reader.read();
+              if (done || !value) break;
+              chunks.push(value);
+              received += value.byteLength;
+            }
+
+            // CRITICAL: Cancel the remaining stream to prevent downloading the whole video!
+            reader.cancel().catch(() => {});
+
+            const merged = new Uint8Array(received);
+            let p = 0;
+            for (const c of chunks) {
+              merged.set(c, p);
+              p += c.byteLength;
+            }
+
+            this.bytesRead += merged.byteLength;
+            this.blockCache.set(blockIndex, merged);
+            this.proxyId = pId;
+            return merged;
+          }
         } else if (res.status === 416) {
-          // Range Not Satisfiable (past EOF)
           const empty = new Uint8Array(0);
           this.blockCache.set(blockIndex, empty);
           return empty;
         }
       } catch (err) {
-        lastError = err;
+        // try next proxy
       }
     }
 
-    throw new Error(
-      `Videoning ${start}-${end} baytlarini yuklab bo'lmadi (CORS yoki server xatoligi). ` +
-      `Iltimos, boshqa CORS Proxy tanlang yoki havolaning amal qilish muddatini tekshiring. Xato: ${lastError?.message || lastError}`
-    );
+    throw new Error(`Videoning ${start}-${end} baytlarini yuklab bo'lmadi. Havola muddati tugagan bo'lishi mumkin.`);
   }
 
   async read(offset: number, length: number): Promise<Uint8Array> {
@@ -163,31 +190,25 @@ export class HttpRangeReader implements DataReader {
     const startBlock = Math.floor(offset / this.BLOCK_SIZE);
     const endBlock = Math.floor((offset + length - 1) / this.BLOCK_SIZE);
 
-    if (startBlock === endBlock) {
-      const blockBytes = await this.fetchBlock(startBlock);
-      const blockOffset = offset % this.BLOCK_SIZE;
-      return blockBytes.slice(blockOffset, Math.min(blockOffset + length, blockBytes.length));
-    }
-
-    // Spans across multiple blocks
     const result = new Uint8Array(length);
-    let bytesCopied = 0;
+    let resultOffset = 0;
 
     for (let b = startBlock; b <= endBlock; b++) {
-      const blockBytes = await this.fetchBlock(b);
+      const blockData = await this.fetchBlock(b);
       const blockStart = b * this.BLOCK_SIZE;
-      const readStart = Math.max(offset, blockStart);
-      const readEnd = Math.min(offset + length, blockStart + blockBytes.length);
 
-      if (readEnd > readStart) {
-        const offsetInBlock = readStart - blockStart;
-        const count = readEnd - readStart;
-        result.set(blockBytes.subarray(offsetInBlock, offsetInBlock + count), bytesCopied);
-        bytesCopied += count;
+      const readStart = Math.max(offset, blockStart);
+      const readEnd = Math.min(offset + length, blockStart + blockData.length);
+
+      if (readStart < readEnd) {
+        const sliceStart = readStart - blockStart;
+        const sliceLength = readEnd - readStart;
+        result.set(blockData.subarray(sliceStart, sliceStart + sliceLength), resultOffset);
+        resultOffset += sliceLength;
       }
     }
 
-    return result.subarray(0, bytesCopied);
+    return result.subarray(0, resultOffset);
   }
 
   getBytesRead(): number {
@@ -197,11 +218,11 @@ export class HttpRangeReader implements DataReader {
   getSourceName(): string {
     try {
       const urlObj = new URL(this.rawUrl);
-      const pathname = urlObj.pathname;
-      const filename = pathname.split('/').filter(Boolean).pop() || 'remote_video';
-      return decodeURIComponent(filename);
+      const pathParts = urlObj.pathname.split('/');
+      const last = pathParts[pathParts.length - 1];
+      return decodeURIComponent(last) || 'remote-video.mkv';
     } catch {
-      return 'remote_video';
+      return 'remote-video.mkv';
     }
   }
 }
