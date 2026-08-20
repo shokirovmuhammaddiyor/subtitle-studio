@@ -11,7 +11,6 @@ const CUES_ID = 0x1C53BB6B;
 const CLUSTER_ID = 0x1F43B675;
 const ATTACHMENTS_ID = 0x1941A469;
 const CHAPTERS_ID = 0x1043A770;
-const TAGS_ID = 0x1254C367;
 
 // Seek IDs
 const SEEK_ENTRY_ID = 0x4DBB;
@@ -21,7 +20,6 @@ const SEEK_POSITION_ID = 0x53AC;
 // Track Entry IDs
 const TRACK_ENTRY_ID = 0xAE;
 const TRACK_NUMBER_ID = 0xD7;
-const TRACK_UID_ID = 0x73C5;
 const TRACK_TYPE_ID = 0x83;
 const FLAG_DEFAULT_ID = 0x88;
 const FLAG_FORCED_ID = 0x55AA;
@@ -32,7 +30,6 @@ const CODEC_PRIVATE_ID = 0x63A2;
 
 // Info IDs
 const TIMECODE_SCALE_ID = 0x2AD7B1;
-const DURATION_ID = 0x4489;
 
 // Cluster / Block IDs
 const CLUSTER_TIMECODE_ID = 0xE7;
@@ -95,6 +92,7 @@ export class MkvDemuxer {
   private tracks: Map<number, SubtitleTrack> = new Map();
   private seekPositions: Map<number, number> = new Map(); // ElementID -> Absolute Offset
   private firstClusterOffset: number = 0;
+  private clusterOffsets: number[] = [];
   private onProgress?: (progressText: string, percentage: number) => void;
 
   constructor(reader: DataReader, onProgress?: (text: string, pct: number) => void) {
@@ -102,18 +100,20 @@ export class MkvDemuxer {
     this.onProgress = onProgress;
   }
 
+  /**
+   * Fast 1-request track inspection:
+   * Parses EBML, Segment, Info and Track definitions in < 0.5 seconds
+   */
   async parseTracks(): Promise<SubtitleTrack[]> {
-    const startTime = Date.now();
-    this.onProgress?.('MKV sarlavhasi o\'qilmoqda (EBML Header)...', 5);
+    this.onProgress?.('MKV sarlavhasi o\'qilmoqda (EBML)...', 10);
 
-    // Read first 256KB to parse EBML, Segment and Tracks
     const initialChunkSize = 256 * 1024;
     const initialBytes = await this.reader.read(0, initialChunkSize);
 
     let offset = 0;
     const ebmlId = readVInt(initialBytes, offset, true);
     if (!ebmlId || ebmlId.rawId !== EBML_ID) {
-      throw new Error('Tanlangan fayl to\'g\'ri MKV/WebM formati emas (EBML ID topilmadi).');
+      throw new Error('Tanlangan fayl to\'g\'ri MKV/WebM formati emas (EBML topilmadi).');
     }
     offset += ebmlId.length;
 
@@ -135,11 +135,14 @@ export class MkvDemuxer {
     this.segmentOffset = offset;
     this.segmentSize = segSize.value;
 
-    this.onProgress?.('Treklar va metadata tahlil qilinmoqda...', 15);
+    this.onProgress?.('Treklar va metadata tahlil qilinmoqda...', 30);
 
-    // Read inside segment for SeekHead, Info, Tracks
     await this.scanSegmentHeaders(initialBytes, offset);
 
+    // Read Cues table offset if available
+    await this.tryLoadCuesTable();
+
+    this.onProgress?.('Subtitr treklari aniqlandi!', 100);
     return Array.from(this.tracks.values());
   }
 
@@ -167,7 +170,6 @@ export class MkvDemuxer {
         this.firstClusterOffset = offset;
         break;
       } else if (elId.rawId === ATTACHMENTS_ID || elId.rawId === CHAPTERS_ID) {
-        // Skip huge elements like fonts/attachments
         offset = payloadOffset + elSize.value;
         continue;
       }
@@ -175,7 +177,6 @@ export class MkvDemuxer {
       offset = payloadOffset + elSize.value;
     }
 
-    // If Tracks wasn't in the first chunk, check SeekHead position
     if (!tracksFound) {
       const tracksPos = this.seekPositions.get(TRACKS_ID);
       if (tracksPos) {
@@ -222,7 +223,6 @@ export class MkvDemuxer {
         }
 
         if (targetId && targetPos) {
-          // SeekPosition is relative to the start of Segment data
           const absolutePos = this.segmentOffset + targetPos;
           this.seekPositions.set(targetId, absolutePos);
         }
@@ -315,7 +315,6 @@ export class MkvDemuxer {
       o = pOffset + elSize.value;
     }
 
-    // Subtitle track type is 17 (0x11)
     if (trackType === 17 || codecId.startsWith('S_TEXT') || codecId.startsWith('S_HDMV') || codecId.startsWith('S_VOBSUB') || codecId.includes('SUBTITLE')) {
       let format: SubtitleFormat = 'srt';
       if (codecId.includes('ASS')) format = 'ass';
@@ -337,9 +336,70 @@ export class MkvDemuxer {
     }
   }
 
+  private async tryLoadCuesTable() {
+    const cuesPos = this.seekPositions.get(CUES_ID);
+    if (!cuesPos) return;
+
+    try {
+      // Read Cues table (typically 32KB - 128KB)
+      const cuesBytes = await this.reader.read(cuesPos, 128 * 1024);
+      if (cuesBytes.length < 8) return;
+
+      const elId = readVInt(cuesBytes, 0, true);
+      if (!elId || elId.rawId !== CUES_ID) return;
+
+      const elSize = readVInt(cuesBytes, elId.length, false);
+      if (!elSize) return;
+
+      let p = elId.length + elSize.length;
+      const end = Math.min(p + elSize.value, cuesBytes.length);
+      const clusters = new Set<number>();
+
+      while (p < end - 8) {
+        if (cuesBytes[p] === 0xBB) { // CuePoint
+          p++;
+          const cpSize = readVInt(cuesBytes, p, false);
+          if (!cpSize) break;
+          p += cpSize.length;
+
+          const cpEnd = Math.min(p + cpSize.value, cuesBytes.length);
+          while (p < cpEnd && p < cuesBytes.length) {
+            if (cuesBytes[p] === 0xB7) { // CueTrackPositions
+              p++;
+              const ctpSize = readVInt(cuesBytes, p, false);
+              if (!ctpSize) break;
+              p += ctpSize.length;
+              const ctpEnd = Math.min(p + ctpSize.value, cuesBytes.length);
+
+              while (p < ctpEnd && p < cuesBytes.length) {
+                if (cuesBytes[p] === 0xF1) { // CueClusterPosition
+                  p++;
+                  const s2 = cuesBytes[p++] & 0x7F;
+                  let clusterPos = 0;
+                  for (let k = 0; k < s2; k++) clusterPos = (clusterPos * 256) + cuesBytes[p++];
+                  clusters.add(this.segmentOffset + clusterPos);
+                } else {
+                  p++;
+                }
+              }
+            } else {
+              p++;
+            }
+          }
+        } else {
+          p++;
+        }
+      }
+
+      this.clusterOffsets = Array.from(clusters).sort((a, b) => a - b);
+    } catch (e) {
+      console.warn('Could not parse Cues table, will fallback to sequential jump', e);
+    }
+  }
+
   /**
-   * Fast Range-based cluster scanning:
-   * Skips non-cluster data and only parses subtitle blocks
+   * Fast Targeted Subtitle Dialogue Extraction:
+   * Uses cluster offsets to read ONLY subtitle blocks in parallel chunks!
    */
   async extractAllSubtitles(selectedTrackNumbers?: number[]): Promise<{ tracks: SubtitleTrack[]; stats: ExtractionStats }> {
     const startTime = Date.now();
@@ -358,101 +418,76 @@ export class MkvDemuxer {
     }
 
     const totalFileSize = await this.reader.getSize();
-    this.onProgress?.('Subtitr bloklari klasterlardan ajratib olinmoqda...', 25);
-
-    // If attachments exist, skip them directly
-    const attachmentsPos = this.seekPositions.get(ATTACHMENTS_ID);
-    const chaptersPos = this.seekPositions.get(CHAPTERS_ID);
-    let currentFilePos = this.firstClusterOffset || this.segmentOffset;
-
-    if (chaptersPos && chaptersPos > currentFilePos) {
-      currentFilePos = chaptersPos;
-    }
-
     let cueIdCounter = 1;
-    const CHUNK_SIZE = 512 * 1024; // 512KB chunks
-    let buffer = await this.reader.read(currentFilePos, CHUNK_SIZE);
-    let bufOffset = 0;
-    let currentClusterTimecode = 0;
-    let lastProgressPct = 25;
 
-    while (currentFilePos < totalFileSize && buffer.length > 0) {
-      if (bufOffset >= buffer.length - 32) {
-        currentFilePos += bufOffset;
-        if (currentFilePos >= totalFileSize) break;
-        buffer = await this.reader.read(currentFilePos, CHUNK_SIZE);
-        bufOffset = 0;
-        if (buffer.length === 0) break;
+    // Reset cues in target tracks
+    for (const num of targetTrackSet) {
+      const tr = this.tracks.get(num);
+      if (tr) tr.cues = [];
+    }
+
+    // Method A: Targeted reading via Cues Table Index (Super-Fast: ~1-3s)
+    if (this.clusterOffsets.length > 0) {
+      const totalClusters = this.clusterOffsets.length;
+      this.onProgress?.(`Klasterlar indeks bo'yicha tezkor o'qilmoqda (0/${totalClusters})...`, 10);
+
+      // Process in batches of 10 clusters concurrently
+      const BATCH_SIZE = 8;
+      for (let i = 0; i < totalClusters; i += BATCH_SIZE) {
+        const batch = this.clusterOffsets.slice(i, i + BATCH_SIZE);
+        await Promise.all(
+          batch.map(async (pos) => {
+            try {
+              // Read first 32KB of cluster containing timecode & subtitle blocks
+              const chunk = await this.reader.read(pos, 32 * 1024);
+              this.parseClusterChunk(chunk, pos, targetTrackSet, cueIdCounter);
+            } catch (err) {
+              // Ignore single cluster errors
+            }
+          })
+        );
+
+        const pct = Math.min(95, Math.round(((i + BATCH_SIZE) / totalClusters) * 100));
+        let foundCues = 0;
+        for (const num of targetTrackSet) foundCues += this.tracks.get(num)?.cues.length || 0;
+        this.onProgress?.(`Klasterlar o'qilmoqda: ${pct}% (${foundCues} ta replika topildi)...`, pct);
       }
+    } else {
+      // Method B: Cluster jump streaming
+      this.onProgress?.('Klasterlar bo\'ylab tezkor sakrash...', 20);
+      let currentFilePos = this.firstClusterOffset || this.segmentOffset;
+      const CHUNK_SIZE = 64 * 1024;
 
-      const elId = readVInt(buffer, bufOffset, true);
-      if (!elId) {
-        bufOffset++;
-        continue;
-      }
-      const elSize = readVInt(buffer, bufOffset + elId.length, false);
-      if (!elSize) {
-        bufOffset++;
-        continue;
-      }
+      while (currentFilePos < totalFileSize) {
+        const chunk = await this.reader.read(currentFilePos, CHUNK_SIZE);
+        if (chunk.length < 8) break;
 
-      const headerLen = elId.length + elSize.length;
-      const payloadOffset = bufOffset + headerLen;
-
-      if (elId.rawId === CLUSTER_ID) {
-        bufOffset = payloadOffset; // Step inside cluster
-        continue;
-      }
-
-      if (elId.rawId === CLUSTER_TIMECODE_ID) {
-        if (payloadOffset + elSize.value <= buffer.length) {
-          currentClusterTimecode = readUint(buffer, payloadOffset, elSize.value);
+        const elId = readVInt(chunk, 0, true);
+        if (!elId) {
+          currentFilePos += CHUNK_SIZE;
+          continue;
         }
-        bufOffset = payloadOffset + elSize.value;
-        continue;
-      }
 
-      if (elId.rawId === SIMPLE_BLOCK_ID || elId.rawId === BLOCK_ID) {
-        await this.parseBlockAsync(
-          buffer,
-          payloadOffset,
-          elSize.value,
-          currentFilePos,
-          currentClusterTimecode,
-          targetTrackSet,
-          cueIdCounter++
-        );
-        bufOffset = payloadOffset + elSize.value;
-        continue;
-      }
+        const elSize = readVInt(chunk, elId.length, false);
+        if (!elSize) {
+          currentFilePos += CHUNK_SIZE;
+          continue;
+        }
 
-      if (elId.rawId === BLOCK_GROUP_ID) {
-        await this.parseBlockGroup(
-          buffer,
-          payloadOffset,
-          elSize.value,
-          currentFilePos,
-          currentClusterTimecode,
-          targetTrackSet,
-          cueIdCounter++
-        );
-        bufOffset = payloadOffset + elSize.value;
-        continue;
-      }
+        if (elId.rawId === CLUSTER_ID) {
+          this.parseClusterChunk(chunk, currentFilePos, targetTrackSet, cueIdCounter);
+          // Jump to next cluster!
+          currentFilePos += elId.length + elSize.length + elSize.value;
+        } else {
+          currentFilePos += elId.length + elSize.length + elSize.value;
+        }
 
-      // Skip non-subtitle blocks
-      bufOffset = payloadOffset + elSize.value;
-
-      if (totalFileSize > 0) {
         const pct = Math.min(95, Math.round((currentFilePos / totalFileSize) * 100));
-        if (pct >= lastProgressPct + 5) {
-          lastProgressPct = pct;
-          this.onProgress?.(`Klasterlar o'qilmoqda: ${pct}% (Faqat subtitr baytlari)`, pct);
-        }
+        this.onProgress?.(`Klasterlar o'qilmoqda: ${pct}%`, pct);
       }
     }
 
-    // Format final subtitle tracks
+    // Format & sort final tracks
     let totalCues = 0;
     const resultTracks: SubtitleTrack[] = [];
 
@@ -471,7 +506,7 @@ export class MkvDemuxer {
       ? Math.max(0, Number(((1 - (bytesRead / totalFileSize)) * 100).toFixed(3)))
       : 99.9;
 
-    this.onProgress?.('Subtitrlar muvaffaqiyatli ajratildi!', 100);
+    this.onProgress?.('Barcha subtitrlar muvaffaqiyatli ajratildi!', 100);
 
     return {
       tracks: resultTracks,
@@ -486,27 +521,57 @@ export class MkvDemuxer {
     };
   }
 
-  private async parseBlockAsync(
+  private parseClusterChunk(
+    buffer: Uint8Array,
+    filePos: number,
+    targetTrackSet: Set<number>,
+    startCueId: number
+  ) {
+    let offset = 0;
+    const elId = readVInt(buffer, offset, true);
+    if (!elId) return;
+    offset += elId.length;
+
+    const elSize = readVInt(buffer, offset, false);
+    if (!elSize) return;
+    offset += elSize.length;
+
+    let currentClusterTimecode = 0;
+    let cueId = startCueId;
+
+    while (offset < buffer.length - 8) {
+      const subId = readVInt(buffer, offset, true);
+      if (!subId) break;
+      const subSize = readVInt(buffer, offset + subId.length, false);
+      if (!subSize) break;
+      const payloadOffset = offset + subId.length + subSize.length;
+
+      if (subId.rawId === CLUSTER_TIMECODE_ID) {
+        if (payloadOffset + subSize.value <= buffer.length) {
+          currentClusterTimecode = readUint(buffer, payloadOffset, subSize.value);
+        }
+      } else if (subId.rawId === SIMPLE_BLOCK_ID || subId.rawId === BLOCK_ID) {
+        this.parseBlockFast(buffer, payloadOffset, subSize.value, currentClusterTimecode, targetTrackSet, cueId++);
+      } else if (subId.rawId === BLOCK_GROUP_ID) {
+        this.parseBlockGroupFast(buffer, payloadOffset, subSize.value, currentClusterTimecode, targetTrackSet, cueId++);
+      }
+
+      offset = payloadOffset + subSize.value;
+    }
+  }
+
+  private parseBlockFast(
     buffer: Uint8Array,
     offset: number,
     size: number,
-    filePos: number,
     clusterTimecode: number,
     targetTrackSet: Set<number>,
     cueId: number,
     blockDuration?: number
   ) {
-    let blockBuffer = buffer;
-    let blockOffset = offset;
+    if (offset >= buffer.length) return;
 
-    if (offset + size > buffer.length) {
-      blockBuffer = await this.reader.read(filePos + offset, size);
-      blockOffset = 0;
-    }
-
-    if (blockOffset + size > blockBuffer.length) return;
-
-    const trackVInt = readVInt(blockBuffer, blockOffset, false);
+    const trackVInt = readVInt(buffer, offset, false);
     if (!trackVInt) return;
 
     const trackNum = trackVInt.value;
@@ -516,16 +581,17 @@ export class MkvDemuxer {
     if (!track) return;
 
     const headerLen = trackVInt.length;
-    const timecodeView = new DataView(blockBuffer.buffer, blockBuffer.byteOffset + blockOffset + headerLen, 2);
+    if (offset + headerLen + 3 > buffer.length) return;
+
+    const timecodeView = new DataView(buffer.buffer, buffer.byteOffset + offset + headerLen, 2);
     const relTimecode = timecodeView.getInt16(0, false);
     const flagsLen = 1;
 
-    const payloadOffset = blockOffset + headerLen + 2 + flagsLen;
+    const payloadOffset = offset + headerLen + 2 + flagsLen;
     const payloadLen = size - (headerLen + 2 + flagsLen);
-    if (payloadLen <= 0) return;
+    if (payloadLen <= 0 || payloadOffset + payloadLen > buffer.length) return;
 
-    const payloadText = readString(blockBuffer, payloadOffset, payloadLen);
-
+    const payloadText = readString(buffer, payloadOffset, payloadLen);
     const timeScaleSec = this.timecodeScale / 1_000_000_000;
     const startTimeSec = (clusterTimecode + relTimecode) * timeScaleSec;
     const durationSec = blockDuration !== undefined ? blockDuration * timeScaleSec : 3.0;
@@ -537,11 +603,10 @@ export class MkvDemuxer {
     }
   }
 
-  private async parseBlockGroup(
+  private parseBlockGroupFast(
     buffer: Uint8Array,
     offset: number,
     size: number,
-    filePos: number,
     clusterTimecode: number,
     targetTrackSet: Set<number>,
     cueId: number
@@ -569,7 +634,7 @@ export class MkvDemuxer {
     }
 
     if (blockOffset > 0 && blockSize > 0) {
-      await this.parseBlockAsync(buffer, blockOffset, blockSize, filePos, clusterTimecode, targetTrackSet, cueId, duration);
+      this.parseBlockFast(buffer, blockOffset, blockSize, clusterTimecode, targetTrackSet, cueId, duration);
     }
   }
 

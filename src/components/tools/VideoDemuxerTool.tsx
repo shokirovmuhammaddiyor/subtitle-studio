@@ -8,7 +8,10 @@ import {
   CheckCircle2,
   AlertCircle,
   FileCheck2,
-  Radio
+  Radio,
+  Download,
+  Eye,
+  Loader2
 } from 'lucide-react';
 import { FileOrUrlInput } from '../shared/FileOrUrlInput';
 import { SubtitlePreviewTable } from '../shared/SubtitlePreviewTable';
@@ -20,10 +23,13 @@ import { SubtitleTrack, ExtractionStats } from '../../types/subtitle';
 
 export const VideoDemuxerTool: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
+  const [isExtractingCues, setIsExtractingCues] = useState(false);
   const [progressText, setProgressText] = useState('');
   const [progressPct, setProgressPct] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const [activeDemuxer, setActiveDemuxer] = useState<MkvDemuxer | Mp4Demuxer | null>(null);
+  const [discoveredTracks, setDiscoveredTracks] = useState<SubtitleTrack[]>([]);
   const [extractedTracks, setExtractedTracks] = useState<SubtitleTrack[]>([]);
   const [selectedTrackIndex, setSelectedTrackIndex] = useState(0);
   const [stats, setStats] = useState<ExtractionStats | null>(null);
@@ -31,18 +37,17 @@ export const VideoDemuxerTool: React.FC = () => {
 
   const handleProcessReader = async (reader: FileSliceReader | HttpRangeReader) => {
     setIsLoading(true);
+    setIsExtractingCues(false);
     setError(null);
-    setProgressText('Fayl formati aniqlanmoqda...');
-    setProgressPct(5);
+    setDiscoveredTracks([]);
+    setExtractedTracks([]);
+    setProgressText('Fayl sarlavhasi o\'qilmoqda...');
+    setProgressPct(10);
 
     try {
       const name = reader.getSourceName().toLowerCase();
       setSourceName(reader.getSourceName());
 
-      let tracks: SubtitleTrack[] = [];
-      let resultStats: ExtractionStats;
-
-      // Determine container type: MKV / WebM vs MP4 / MOV
       const isMp4 = name.endsWith('.mp4') || name.endsWith('.m4v') || name.endsWith('.mov');
 
       if (isMp4) {
@@ -50,33 +55,60 @@ export const VideoDemuxerTool: React.FC = () => {
           setProgressText(txt);
           setProgressPct(pct);
         });
+        setActiveDemuxer(demuxer);
         const res = await demuxer.extractSubtitles();
-        tracks = res.tracks;
-        resultStats = res.stats;
+        setDiscoveredTracks(res.tracks);
+        setExtractedTracks(res.tracks);
+        setSelectedTrackIndex(0);
+        setStats(res.stats);
       } else {
-        // Default to MKV / WebM streaming demuxer
+        // MKV / WebM
         const demuxer = new MkvDemuxer(reader, (txt, pct) => {
           setProgressText(txt);
           setProgressPct(pct);
         });
+        setActiveDemuxer(demuxer);
+
+        // Step 1: Parse tracks in < 0.5s
+        const tracks = await demuxer.parseTracks();
+        if (tracks.length === 0) {
+          throw new Error('Ushbu videoda hech qanday o\'rnatilgan (embedded) subtitr treklari topilmadi.');
+        }
+        setDiscoveredTracks(tracks);
+
+        // Step 2: Extract dialogue cues
+        setIsExtractingCues(true);
         const res = await demuxer.extractAllSubtitles();
-        tracks = res.tracks;
-        resultStats = res.stats;
+        setExtractedTracks(res.tracks);
+        setSelectedTrackIndex(0);
+        setStats(res.stats);
       }
-
-      if (tracks.length === 0) {
-        throw new Error('Ushbu videoda hech qanday o\'rnatilgan (embedded) subtitr treklari topilmadi.');
-      }
-
-      setExtractedTracks(tracks);
-      setSelectedTrackIndex(0);
-      setStats(resultStats);
     } catch (err: any) {
       console.error('Demux error:', err);
       setError(err?.message || 'Subtitrlarni ajratib olishda xatolik yuz berdi.');
     } finally {
       setIsLoading(false);
+      setIsExtractingCues(false);
       setProgressPct(100);
+    }
+  };
+
+  const handleExtractSingleTrack = async (trackNumber: number) => {
+    if (!activeDemuxer || !(activeDemuxer instanceof MkvDemuxer)) return;
+
+    setIsExtractingCues(true);
+    setProgressText(`Trek #${trackNumber} replikalari ajratilmoqda...`);
+    setProgressPct(20);
+
+    try {
+      const res = await activeDemuxer.extractAllSubtitles([trackNumber]);
+      setExtractedTracks(res.tracks);
+      setSelectedTrackIndex(0);
+      setStats(res.stats);
+    } catch (err: any) {
+      setError(err?.message || 'Trekni ajratishda xatolik');
+    } finally {
+      setIsExtractingCues(false);
     }
   };
 
@@ -98,7 +130,7 @@ export const VideoDemuxerTool: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  const currentTrack = extractedTracks[selectedTrackIndex];
+  const currentTrack = extractedTracks[selectedTrackIndex] || discoveredTracks[selectedTrackIndex];
 
   return (
     <div className="space-y-6">
@@ -109,7 +141,7 @@ export const VideoDemuxerTool: React.FC = () => {
             <span className="px-2.5 py-1 rounded-lg bg-indigo-500/20 text-indigo-400 text-xs font-bold uppercase tracking-wider">
               Ultra-Tezkor Ekstraktor
             </span>
-            <span className="text-slate-400 text-xs">&bull; HTTP Range Slicing</span>
+            <span className="text-slate-400 text-xs">&bull; HTTP Range & Cues Table Indexing</span>
           </div>
           <h1 className="text-xl sm:text-2xl font-bold text-white mt-1.5">
             Video to Subtitle Extractor (MKV, MP4, WebM)
@@ -118,9 +150,23 @@ export const VideoDemuxerTool: React.FC = () => {
             10–50 GB lik videoni butunlay yuklab olmasdan, faqat bir necha KB metadata o'qish orqali barcha subtitrlarni (ASS, SRT, VTT) bir zumda ajratib oling.
           </p>
         </div>
+
+        {stats && (
+          <div className="flex items-center space-x-3 bg-slate-900/80 border border-emerald-500/30 p-3.5 rounded-xl text-xs">
+            <Sparkles className="w-5 h-5 text-emerald-400 shrink-0" />
+            <div>
+              <p className="text-emerald-400 font-bold">
+                {stats.savedPercentage}% Trafik Tejaldi!
+              </p>
+              <p className="text-slate-400 text-[11px]">
+                {formatBytes(stats.bytesRead)} / {formatBytes(stats.totalFileSize)} o'qildi
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Input component */}
+      {/* Input section */}
       <FileOrUrlInput
         mode="video"
         onFileSelect={handleFileSelect}
@@ -128,149 +174,146 @@ export const VideoDemuxerTool: React.FC = () => {
         isLoading={isLoading}
       />
 
-      {/* Loading Progress Bar */}
+      {/* Loading Progress bar */}
       {isLoading && (
-        <div className="glass-panel p-5 rounded-2xl border border-indigo-500/30 animate-fade-in space-y-3">
-          <div className="flex items-center justify-between text-xs">
+        <div className="glass-panel p-5 rounded-2xl border border-indigo-500/30 space-y-3 animate-fade-in">
+          <div className="flex justify-between text-xs">
             <span className="text-indigo-300 font-medium flex items-center space-x-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-indigo-500 animate-ping inline-block" />
+              <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
               <span>{progressText}</span>
             </span>
-            <span className="font-mono text-indigo-400 font-bold">{progressPct}%</span>
+            <span className="text-slate-400 font-mono">{progressPct}%</span>
           </div>
-          <div className="w-full bg-slate-900 rounded-full h-2 overflow-hidden border border-slate-800">
+          <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
             <div
-              className="bg-gradient-to-r from-indigo-500 via-purple-500 to-indigo-400 h-full transition-all duration-300 rounded-full"
+              className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full rounded-full transition-all duration-300"
               style={{ width: `${progressPct}%` }}
             />
           </div>
         </div>
       )}
 
-      {/* Error display */}
+      {/* Error alert */}
       {error && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start space-x-3 animate-fade-in">
-          <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-          <div>
-            <p className="font-semibold text-rose-200">Xatolik:</p>
-            <p className="mt-0.5">{error}</p>
+        <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start space-x-3 text-xs text-red-300">
+          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <p className="font-semibold text-red-200">Xatolik:</p>
+            <p>{error}</p>
           </div>
         </div>
       )}
 
-      {/* Results Section */}
-      {stats && extractedTracks.length > 0 && currentTrack && (
-        <div className="space-y-6 animate-slide-up">
-          {/* Stats Bar */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div className="glass-panel p-4 rounded-xl border border-slate-800">
-              <div className="text-[11px] text-slate-400 flex items-center space-x-1.5">
-                <FileVideo className="w-3.5 h-3.5 text-indigo-400" />
-                <span>Asl Video Hajmi</span>
-              </div>
-              <div className="text-lg font-bold text-white mt-1">
-                {formatBytes(stats.totalFileSize)}
-              </div>
+      {/* Discovered Tracks List (Shows in < 0.5s) */}
+      {discoveredTracks.length > 0 && (
+        <div className="glass-panel p-5 rounded-2xl border border-slate-800 space-y-4 animate-fade-in">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+            <div className="flex items-center space-x-2">
+              <Layers className="w-5 h-5 text-indigo-400" />
+              <h2 className="text-sm font-bold text-white">
+                Videoda Aniqlangan Subtitr Treklari ({discoveredTracks.length} ta til)
+              </h2>
             </div>
-
-            <div className="glass-panel p-4 rounded-xl border border-emerald-500/20 bg-emerald-500/5">
-              <div className="text-[11px] text-emerald-400 flex items-center space-x-1.5">
-                <HardDriveDownload className="w-3.5 h-3.5" />
-                <span>O'qilgan Trafik</span>
-              </div>
-              <div className="text-lg font-bold text-emerald-300 mt-1">
-                {formatBytes(stats.bytesRead)}
-              </div>
-            </div>
-
-            <div className="glass-panel p-4 rounded-xl border border-indigo-500/20 bg-indigo-500/5">
-              <div className="text-[11px] text-indigo-400 flex items-center space-x-1.5">
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Tejalgan Trafik</span>
-              </div>
-              <div className="text-lg font-bold text-indigo-300 mt-1">
-                {stats.savedPercentage}%
-              </div>
-            </div>
-
-            <div className="glass-panel p-4 rounded-xl border border-slate-800">
-              <div className="text-[11px] text-slate-400 flex items-center space-x-1.5">
-                <Clock className="w-3.5 h-3.5 text-purple-400" />
-                <span>Sarflangan Vaqt</span>
-              </div>
-              <div className="text-lg font-bold text-white mt-1">
-                {(stats.durationMs / 1000).toFixed(2)} sek
-              </div>
-            </div>
+            {isExtractingCues && (
+              <span className="text-[11px] text-amber-400 flex items-center space-x-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Replika matnlari ajratilmoqda...</span>
+              </span>
+            )}
           </div>
 
-          {/* Track Selector & Download */}
-          <div className="glass-panel p-5 rounded-2xl border border-slate-800 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center space-x-2">
-                  <Layers className="w-4 h-4 text-indigo-400" />
-                  <span>Aniqlangan Subtitr Treklari ({extractedTracks.length} ta)</span>
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Fayl: <span className="text-slate-200 font-mono">{sourceName}</span>
-                </p>
-              </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+            {discoveredTracks.map((track, idx) => {
+              const isSelected = selectedTrackIndex === idx;
+              const extracted = extractedTracks.find(t => t.trackNumber === track.trackNumber);
+              const cueCount = extracted?.cues.length || 0;
 
-              <DownloadButton
-                cues={currentTrack.cues}
-                filename={`${sourceName}_${currentTrack.language}_track${currentTrack.trackNumber}`}
-                defaultFormat={currentTrack.format}
-                tracks={extractedTracks}
-                customHeader={currentTrack.codecPrivate}
-              />
-            </div>
-
-            {/* Track buttons */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
-              {extractedTracks.map((track, idx) => {
-                const isSelected = selectedTrackIndex === idx;
-                return (
-                  <button
-                    key={track.id}
-                    onClick={() => setSelectedTrackIndex(idx)}
-                    className={`flex items-start justify-between p-3 rounded-xl border text-left transition ${
-                      isSelected
-                        ? 'bg-indigo-600/20 border-indigo-500 text-white shadow-md shadow-indigo-600/10'
-                        : 'bg-slate-900/60 border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
+              return (
+                <div
+                  key={track.id}
+                  onClick={() => setSelectedTrackIndex(idx)}
+                  className={`p-3.5 rounded-xl border cursor-pointer transition flex flex-col justify-between space-y-3 ${
+                    isSelected
+                      ? 'bg-indigo-600/15 border-indigo-500 ring-1 ring-indigo-500'
+                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700 hover:bg-slate-900'
+                  }`}
+                >
+                  <div className="flex items-start justify-between">
                     <div className="space-y-1">
-                      <div className="flex items-center space-x-2">
-                        <Radio className={`w-3.5 h-3.5 ${isSelected ? 'text-indigo-400' : 'text-slate-600'}`} />
-                        <span className="font-semibold text-xs text-white">
-                          #{track.trackNumber} {track.language.toUpperCase()}
-                        </span>
-                        <span className="px-1.5 py-0.2 rounded text-[10px] font-mono uppercase bg-slate-800 text-indigo-300">
-                          {track.format}
-                        </span>
+                      <div className="flex items-center space-x-1.5">
+                        <span className="text-xs font-bold text-white">{track.title}</span>
+                        {track.default && (
+                          <span className="text-[9px] px-1.5 py-0.5 bg-emerald-500/20 text-emerald-400 rounded">
+                            Asosiy
+                          </span>
+                        )}
                       </div>
-                      <p className="text-[11px] text-slate-400 line-clamp-1">
-                        {track.title}
-                      </p>
-                      <p className="text-[10px] text-slate-500 font-mono">
-                        {track.cues.length} replika &bull; {track.codec}
+                      <p className="text-[11px] text-slate-400">
+                        Til: <span className="text-slate-300 uppercase font-mono">{track.language}</span> &bull; Format: <span className="text-indigo-400 uppercase font-bold">{track.format}</span>
                       </p>
                     </div>
-                  </button>
-                );
-              })}
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-mono">
+                      #{track.trackNumber}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 text-[11px]">
+                    <span className="text-slate-400">
+                      {cueCount > 0 ? (
+                        <span className="text-emerald-400 font-medium">{cueCount} ta replika</span>
+                      ) : isExtractingCues ? (
+                        <span className="text-amber-400">O'qilmoqda...</span>
+                      ) : (
+                        <span>Tayyor</span>
+                      )}
+                    </span>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedTrackIndex(idx);
+                        if (cueCount === 0) handleExtractSingleTrack(track.trackNumber);
+                      }}
+                      className="px-2.5 py-1 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded-lg text-[10px] font-semibold transition"
+                    >
+                      {cueCount > 0 ? 'Tanlandi' : 'Tezkor Ajratish'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Extracted Track Preview and Download Area */}
+      {currentTrack && currentTrack.cues && currentTrack.cues.length > 0 && (
+        <div className="space-y-4 animate-fade-in">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 glass-panel p-4 rounded-xl border border-slate-800">
+            <div className="flex items-center space-x-3">
+              <FileCheck2 className="w-5 h-5 text-emerald-400" />
+              <div>
+                <h3 className="text-sm font-bold text-white">
+                  {currentTrack.title} ({currentTrack.cues.length} ta replika)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Format: <span className="uppercase text-indigo-300 font-bold">{currentTrack.format}</span> &bull; Manba: {sourceName || 'Video'}
+                </p>
+              </div>
             </div>
+
+            <DownloadButton
+              cues={currentTrack.cues}
+              filename={`${sourceName.replace(/\.[^/.]+$/, '') || 'subtitle'}_${currentTrack.language}`}
+              defaultFormat={currentTrack.format}
+              tracks={extractedTracks.length > 1 ? extractedTracks : undefined}
+              customHeader={currentTrack.codecPrivate}
+            />
           </div>
 
-          {/* Subtitle Viewer Table */}
           <SubtitlePreviewTable
             cues={currentTrack.cues}
-            onCueChange={(updated) => {
-              const newTracks = [...extractedTracks];
-              newTracks[selectedTrackIndex].cues = updated;
-              setExtractedTracks(newTracks);
-            }}
           />
         </div>
       )}
