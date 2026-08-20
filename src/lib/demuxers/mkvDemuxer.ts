@@ -369,10 +369,11 @@ export class MkvDemuxer {
 
       // Check for SimpleBlock or BlockGroup
       if (elId.rawId === SIMPLE_BLOCK_ID || elId.rawId === BLOCK_ID) {
-        this.parseBlock(
+        await this.parseBlockAsync(
           buffer,
           payloadOffset,
           elSize.value,
+          currentFilePos,
           currentClusterTimecode,
           targetTrackSet,
           cueIdCounter++
@@ -382,10 +383,11 @@ export class MkvDemuxer {
       }
 
       if (elId.rawId === BLOCK_GROUP_ID) {
-        this.parseBlockGroup(
+        await this.parseBlockGroup(
           buffer,
           payloadOffset,
           elSize.value,
+          currentFilePos,
           currentClusterTimecode,
           targetTrackSet,
           cueIdCounter++
@@ -438,18 +440,28 @@ export class MkvDemuxer {
     };
   }
 
-  private parseBlock(
+  private async parseBlockAsync(
     buffer: Uint8Array,
     offset: number,
     size: number,
+    filePos: number,
     clusterTimecode: number,
     targetTrackSet: Set<number>,
     cueId: number,
     blockDuration?: number
   ) {
-    if (offset + size > buffer.length) return;
+    let blockBuffer = buffer;
+    let blockOffset = offset;
 
-    const trackVInt = readVInt(buffer, offset, false);
+    // If block spans beyond current chunk buffer, fetch exact slice
+    if (offset + size > buffer.length) {
+      blockBuffer = await this.reader.read(filePos + offset, size);
+      blockOffset = 0;
+    }
+
+    if (blockOffset + size > blockBuffer.length) return;
+
+    const trackVInt = readVInt(blockBuffer, blockOffset, false);
     if (!trackVInt) return;
 
     const trackNum = trackVInt.value;
@@ -460,16 +472,16 @@ export class MkvDemuxer {
 
     const headerLen = trackVInt.length;
     // 2 bytes: relative timecode (int16 signed)
-    const timecodeView = new DataView(buffer.buffer, buffer.byteOffset + offset + headerLen, 2);
+    const timecodeView = new DataView(blockBuffer.buffer, blockBuffer.byteOffset + blockOffset + headerLen, 2);
     const relTimecode = timecodeView.getInt16(0, false);
     // 1 byte flags
     const flagsLen = 1;
 
-    const payloadOffset = offset + headerLen + 2 + flagsLen;
+    const payloadOffset = blockOffset + headerLen + 2 + flagsLen;
     const payloadLen = size - (headerLen + 2 + flagsLen);
     if (payloadLen <= 0) return;
 
-    const payloadText = readString(buffer, payloadOffset, payloadLen);
+    const payloadText = readString(blockBuffer, payloadOffset, payloadLen);
 
     // Calculate timestamps in seconds
     const timeScaleSec = this.timecodeScale / 1_000_000_000;
@@ -484,10 +496,11 @@ export class MkvDemuxer {
     }
   }
 
-  private parseBlockGroup(
+  private async parseBlockGroup(
     buffer: Uint8Array,
     offset: number,
     size: number,
+    filePos: number,
     clusterTimecode: number,
     targetTrackSet: Set<number>,
     cueId: number
@@ -515,7 +528,7 @@ export class MkvDemuxer {
     }
 
     if (blockOffset > 0 && blockSize > 0) {
-      this.parseBlock(buffer, blockOffset, blockSize, clusterTimecode, targetTrackSet, cueId, duration);
+      await this.parseBlockAsync(buffer, blockOffset, blockSize, filePos, clusterTimecode, targetTrackSet, cueId, duration);
     }
   }
 

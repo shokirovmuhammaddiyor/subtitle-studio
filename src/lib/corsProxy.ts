@@ -6,24 +6,24 @@ export interface CorsProxy {
 
 export const CORS_PROXIES: CorsProxy[] = [
   {
-    id: 'direct',
-    name: 'To\'g\'ridan-to\'g\'ri (Direct - agar CORS ruxsat etilgan bo\'lsa)',
-    urlPattern: (url) => url,
-  },
-  {
     id: 'corsproxy_io',
-    name: 'CORSProxy.io (Tezkor va barqaror)',
+    name: 'CORSProxy.io (Tavsiya etiladi - Range qo\'llab-quvvatlaydi)',
     urlPattern: (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
   },
   {
-    id: 'allorigins',
-    name: 'AllOrigins.win (Range requestlar bilan)',
-    urlPattern: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    id: 'corsproxy_org',
+    name: 'CORSProxy.org (Muqobil)',
+    urlPattern: (url) => `https://corsproxy.org/?${encodeURIComponent(url)}`,
   },
   {
-    id: 'codetabs',
-    name: 'CodeTabs Proxy',
-    urlPattern: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    id: 'corsfix',
+    name: 'CorsFix Proxy',
+    urlPattern: (url) => `https://proxy.corsfix.com/?${encodeURIComponent(url)}`,
+  },
+  {
+    id: 'direct',
+    name: 'To\'g\'ridan-to\'g\'ri (Direct - agar CORS ruxsat etilgan bo\'lsa)',
+    urlPattern: (url) => url,
   },
 ];
 
